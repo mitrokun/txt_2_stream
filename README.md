@@ -9,6 +9,6 @@ The component provides a  action (service) that initiates the synthesis of text 
 
 
 
-The restriction to Wyoming servers was deliberately chosen, as this method allows for position synchronization, control over the synthesis queue, and avoids unnecessary resource consumption.
+The restriction to the Wyoming protocol only was chosen intentionally, as it allows for precise position synchronization, control over the synthesis queue, and avoidance of unnecessary resource consumption.
 
 Working with system abstractions is potentially possible, but not a stable solution (since different voices have different tempos).
