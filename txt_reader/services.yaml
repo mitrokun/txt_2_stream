@@ -1,0 +1,39 @@
+play:
+  name: "txt2stream"
+  description: "Reads a text file using Wyoming TTS."
+  fields:
+    config_entry:
+      name: "Server Instance"
+      description: "Select the TXT Reader integration instance to use."
+      required: true
+      selector:
+        config_entry:
+          integration: txt_reader
+    entity_id:
+      name: "Media Player"
+      description: "Target player(s)."
+      required: true
+      selector:
+        entity:
+          domain: media_player
+    file_path:
+      name: "File Path"
+      description: "Full path to book.txt."
+      required: true
+      selector:
+        text: {}
+    voice:
+      name: "Voice"
+      description: "Override default voice (optional)."
+      required: false
+      selector:
+        text: {}
+    block_index:
+      name: "Start Block Index"
+      description: "Optional: Start from a specific block number (0 for beginning)."
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 99999
+          mode: box
