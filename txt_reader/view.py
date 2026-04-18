@@ -38,6 +38,12 @@ class TxtReaderStreamView(HomeAssistantView):
         chunks = session["chunks"]
         store = session["store"]
 
+        # Calculate pacing threshold based on user settings
+        # INITIAL_BURST ensures the player fills its buffer quickly at the start
+        buffer_setting = config.get("buffer_blocks", 2)
+        lead_time_limit = buffer_setting * 12.0
+        initial_burst_seconds = 15.0 
+
         start_index = session.get("start_index", store.get_progress(file_path))
         session.pop("start_index", None)
 
@@ -45,7 +51,7 @@ class TxtReaderStreamView(HomeAssistantView):
         response.content_type = "audio/wav"
         await response.prepare(request)
 
-        # Queue for pre-fetched audio blocks
+        # Queue with maxsize=1 handles backpressure automatically
         ready_blocks = asyncio.Queue(maxsize=1)
         state = {"bytes_per_sec": 44100, "header_sent": False, "stop": False}
 
@@ -55,6 +61,7 @@ class TxtReaderStreamView(HomeAssistantView):
                 for i in range(start_index, len(chunks)):
                     if state["stop"]:
                         break
+
                     audio_data = bytearray()
                     async with AsyncTcpClient(config["host"], config["port"]) as client:
                         voice = SynthesizeVoice(name=config["voice"]) if config.get("voice") else None
@@ -70,10 +77,12 @@ class TxtReaderStreamView(HomeAssistantView):
                                 info = AudioStart.from_event(event)
                                 state["bytes_per_sec"] = info.rate * info.width * info.channels
                             elif AudioChunk.is_type(event.type):
+                                # Correct way to access audio payload
                                 audio_data.extend(AudioChunk.from_event(event).audio)
                             elif SynthesizeStopped.is_type(event.type):
                                 break
                     
+                    # Blocks automatically if ready_blocks is full
                     await ready_blocks.put({'idx': i, 'data': bytes(audio_data)})
             except Exception:
                 pass
@@ -81,6 +90,15 @@ class TxtReaderStreamView(HomeAssistantView):
                 await ready_blocks.put(None)
 
         feeder_task = asyncio.create_task(text_feeder())
+        
+        # Suppress "Future exception was never retrieved" logs
+        def _handle_task_result(task):
+            try:
+                if not task.cancelled():
+                    task.exception()
+            except Exception:
+                pass
+        feeder_task.add_done_callback(_handle_task_result)
 
         # Audio streaming logic
         bytes_sent = 0
@@ -102,7 +120,7 @@ class TxtReaderStreamView(HomeAssistantView):
                     await response.write(header)
                     state["header_sent"] = True
 
-                # Stream audio chunks with rate-limiting to match playback speed
+                # Stream audio chunks with rate-limiting (Pacing)
                 audio_bytes = block['data']
                 chunk_size = 4096 
                 
@@ -111,12 +129,17 @@ class TxtReaderStreamView(HomeAssistantView):
                     await response.write(chunk)
                     bytes_sent += len(chunk)
 
-                    # Throttle stream if buffer builds up to prevent connection timeout
+                    # Pacing calculation
                     total_audio_sec = bytes_sent / state["bytes_per_sec"]
                     real_elapsed_sec = time.time() - start_time
                     
-                    if total_audio_sec > (real_elapsed_sec + 10):
-                        await asyncio.sleep(0.1)
+                    # Combine user setting with initial burst protection
+                    # This allows the first ~15s of audio to transfer at full speed
+                    current_limit = max(lead_time_limit, initial_burst_seconds)
+                    
+                    if total_audio_sec > (real_elapsed_sec + current_limit):
+                        wait_time = total_audio_sec - (real_elapsed_sec + current_limit)
+                        await asyncio.sleep(min(wait_time, 0.5))
         
         except (ConnectionResetError, asyncio.CancelledError):
             pass
