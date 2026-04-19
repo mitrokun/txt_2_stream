@@ -1,4 +1,4 @@
-"""HTTP View for TXT Reader with block-duration pacing."""
+"""HTTP View for TXT Reader with block-duration pacing and start-up protection."""
 import asyncio
 import logging
 import time
@@ -38,8 +38,6 @@ class TxtReaderStreamView(HomeAssistantView):
         chunks = session["chunks"]
         store = session["store"]
 
-        # Calculate pacing threshold based on user settings
-        # INITIAL_BURST ensures the player fills its buffer quickly at the start
         buffer_setting = config.get("buffer_blocks", 2)
         lead_time_limit = buffer_setting * 12.0
         initial_burst_seconds = 15.0 
@@ -51,7 +49,6 @@ class TxtReaderStreamView(HomeAssistantView):
         response.content_type = "audio/wav"
         await response.prepare(request)
 
-        # Queue with maxsize=1 handles backpressure automatically
         ready_blocks = asyncio.Queue(maxsize=1)
         state = {"bytes_per_sec": 44100, "header_sent": False, "stop": False}
 
@@ -63,27 +60,35 @@ class TxtReaderStreamView(HomeAssistantView):
                         break
 
                     audio_data = bytearray()
-                    async with AsyncTcpClient(config["host"], config["port"]) as client:
-                        voice = SynthesizeVoice(name=config["voice"]) if config.get("voice") else None
-                        await client.write_event(SynthesizeStart(voice=voice).event())
-                        await client.write_event(SynthesizeChunk(text=chunks[i]).event())
-                        await client.write_event(SynthesizeStop().event())
-                        
-                        while True:
-                            event = await client.read_event()
-                            if event is None:
-                                break
-                            if AudioStart.is_type(event.type):
-                                info = AudioStart.from_event(event)
-                                state["bytes_per_sec"] = info.rate * info.width * info.channels
-                            elif AudioChunk.is_type(event.type):
-                                # Correct way to access audio payload
-                                audio_data.extend(AudioChunk.from_event(event).audio)
-                            elif SynthesizeStopped.is_type(event.type):
-                                break
-                    
-                    # Blocks automatically if ready_blocks is full
-                    await ready_blocks.put({'idx': i, 'data': bytes(audio_data)})
+                    try:
+                        async with AsyncTcpClient(config["host"], config["port"]) as client:
+                            voice = SynthesizeVoice(name=config["voice"]) if config.get("voice") else None
+                            await client.write_event(SynthesizeStart(voice=voice).event())
+                            await client.write_event(SynthesizeChunk(text=chunks[i]).event())
+                            await client.write_event(SynthesizeStop().event())
+                            
+                            while True:
+                                event = await client.read_event()
+                                if event is None:
+                                    break
+                                if AudioStart.is_type(event.type):
+                                    info = AudioStart.from_event(event)
+                                    state["bytes_per_sec"] = info.rate * info.width * info.channels
+                                elif AudioChunk.is_type(event.type):
+                                    audio_data.extend(AudioChunk.from_event(event).audio)
+                                elif SynthesizeStopped.is_type(event.type):
+                                    break
+                    except Exception as e:
+                        _LOGGER.error("Connection to Wyoming lost at block %s: %s", i, e)
+                        break
+
+                    if not audio_data and i == start_index:
+                        _LOGGER.error("Wyoming returned NO audio for the first block. Check voice: '%s'", config.get("voice"))
+                        await ready_blocks.put("ERROR")
+                        return
+
+                    if audio_data:
+                        await ready_blocks.put({'idx': i, 'data': bytes(audio_data)})
             except Exception:
                 pass
             finally:
@@ -91,7 +96,6 @@ class TxtReaderStreamView(HomeAssistantView):
 
         feeder_task = asyncio.create_task(text_feeder())
         
-        # Suppress "Future exception was never retrieved" logs
         def _handle_task_result(task):
             try:
                 if not task.cancelled():
@@ -100,7 +104,6 @@ class TxtReaderStreamView(HomeAssistantView):
                 pass
         feeder_task.add_done_callback(_handle_task_result)
 
-        # Audio streaming logic
         bytes_sent = 0
         start_time = time.time()
         current_idx = start_index
@@ -108,7 +111,7 @@ class TxtReaderStreamView(HomeAssistantView):
         try:
             while True:
                 block = await ready_blocks.get()
-                if block is None:
+                if block is None or block == "ERROR":
                     break
                 
                 current_idx = block['idx']
@@ -120,7 +123,6 @@ class TxtReaderStreamView(HomeAssistantView):
                     await response.write(header)
                     state["header_sent"] = True
 
-                # Stream audio chunks with rate-limiting (Pacing)
                 audio_bytes = block['data']
                 chunk_size = 4096 
                 
@@ -129,12 +131,8 @@ class TxtReaderStreamView(HomeAssistantView):
                     await response.write(chunk)
                     bytes_sent += len(chunk)
 
-                    # Pacing calculation
                     total_audio_sec = bytes_sent / state["bytes_per_sec"]
                     real_elapsed_sec = time.time() - start_time
-                    
-                    # Combine user setting with initial burst protection
-                    # This allows the first ~15s of audio to transfer at full speed
                     current_limit = max(lead_time_limit, initial_burst_seconds)
                     
                     if total_audio_sec > (real_elapsed_sec + current_limit):
