@@ -37,3 +37,13 @@ play:
           min: 0
           max: 99999
           mode: box
+    timer:
+      name: "Sleep Timer"
+      description: "Time in minutes to play before stopping automatically."
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 480
+          unit_of_measurement: "min"
+          mode: box
